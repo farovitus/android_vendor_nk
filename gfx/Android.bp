@@ -1,0 +1,102 @@
+// Mesa panfrost, minigbm gralloc and the KMS HWC for the Mali-T760 on the
+// mainline 6.6 kernel. The binaries are built with the NDK by the scripts in
+// source/; see source/README.md. Module names carry an nk_ prefix so they do
+// not clash with external/mesa3d and external/minigbm; stem keeps the file
+// names the loaders look for.
+
+cc_prebuilt_library_shared {
+    name: "nk_libglapi",
+    stem: "libglapi",
+    vendor: true,
+    compile_multilib: "both",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/libglapi.so"] },
+        arm64: { srcs: ["prebuilts/lib64/libglapi.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_libgallium_dri",
+    stem: "libgallium_dri",
+    vendor: true,
+    compile_multilib: "both",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/libgallium_dri.so"] },
+        arm64: { srcs: ["prebuilts/lib64/libgallium_dri.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_libEGL_mesa",
+    stem: "libEGL_mesa",
+    vendor: true,
+    compile_multilib: "both",
+    relative_install_path: "egl",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/egl/libEGL_mesa.so"] },
+        arm64: { srcs: ["prebuilts/lib64/egl/libEGL_mesa.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_libGLESv1_CM_mesa",
+    stem: "libGLESv1_CM_mesa",
+    vendor: true,
+    compile_multilib: "both",
+    relative_install_path: "egl",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/egl/libGLESv1_CM_mesa.so"] },
+        arm64: { srcs: ["prebuilts/lib64/egl/libGLESv1_CM_mesa.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_libGLESv2_mesa",
+    stem: "libGLESv2_mesa",
+    vendor: true,
+    compile_multilib: "both",
+    relative_install_path: "egl",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/egl/libGLESv2_mesa.so"] },
+        arm64: { srcs: ["prebuilts/lib64/egl/libGLESv2_mesa.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_gralloc.minigbm",
+    stem: "gralloc.minigbm",
+    vendor: true,
+    compile_multilib: "both",
+    relative_install_path: "hw",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/hw/gralloc.minigbm.so"] },
+        arm64: { srcs: ["prebuilts/lib64/hw/gralloc.minigbm.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+
+cc_prebuilt_library_shared {
+    name: "nk_hwcomposer.s6kms",
+    stem: "hwcomposer.s6kms",
+    vendor: true,
+    compile_multilib: "both",
+    relative_install_path: "hw",
+    arch: {
+        arm: { srcs: ["prebuilts/lib/hw/hwcomposer.s6kms.so"] },
+        arm64: { srcs: ["prebuilts/lib64/hw/hwcomposer.s6kms.so"] },
+    },
+    check_elf_files: false,
+    strip: { none: true },
+}
+

@@ -1,0 +1,33 @@
+diff --git a/drv.c b/drv.c
+index 4f5f74a..dea545d 100644
+--- a/drv.c
++++ b/drv.c
+@@ -50,6 +50,7 @@ extern const struct backend backend_vc4;
+ 
+ // Dumb / generic drivers
+ extern const struct backend backend_evdi;
++extern const struct backend backend_exynos;
+ extern const struct backend backend_marvell;
+ extern const struct backend backend_mediatek;
+ extern const struct backend backend_meson;
+@@ -81,7 +82,7 @@ static const struct backend *drv_backend_list[] = {
+ #ifdef DRV_XE
+ 	&backend_xe,
+ #endif
+-	&backend_evdi,	    &backend_komeda,	&backend_marvell, &backend_mediatek,
++	&backend_evdi,	    &backend_exynos,	&backend_komeda,	&backend_marvell, &backend_mediatek,
+ 	&backend_meson,	    &backend_nouveau,	&backend_radeon,  &backend_rockchip,
+ 	&backend_sun4i_drm, &backend_synaptics, &backend_udl,	  &backend_virtgpu,
+ 	&backend_vkms,	    &backend_mock
+diff --git a/dumb_driver.c b/dumb_driver.c
+index 98c9ba7..287f224 100644
+--- a/dumb_driver.c
++++ b/dumb_driver.c
+@@ -66,6 +66,7 @@ static int dumb_bo_create_with_modifiers(struct bo *bo, uint32_t width, uint32_t
+ }
+ 
+ INIT_DUMB_DRIVER(evdi)
++INIT_DUMB_DRIVER(exynos)
+ INIT_DUMB_DRIVER(komeda)
+ INIT_DUMB_DRIVER(marvell)
+ INIT_DUMB_DRIVER(meson)
