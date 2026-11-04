@@ -1,0 +1,17 @@
+# Bring-up only: keep logcat on /data so it can be read from TWRP.
+service s6logcat /system/bin/logcat -b main -b system -b crash -b events -v threadtime -f /data/local/tmp/s6-logcat.txt -r 8192 -n 4
+    user root
+    group root log
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
+
+on post-fs-data
+    exec -- /system/bin/rm -f /data/local/tmp/s6-logcat.txt /data/local/tmp/s6-logcat.txt.1 /data/local/tmp/s6-logcat.txt.2 /data/local/tmp/s6-logcat.txt.3 /data/local/tmp/s6-logcat.txt.4
+    start s6logcat
+
+# A completed boot stays up: cancel the kernel's test-boot auto-recovery.
+# SurfaceFlinger sets service.bootanim.exit when the boot animation ends;
+# sys.boot_completed waits for the first unlock of a secured user.
+on property:service.bootanim.exit=1
+    write /sys/module/dsh_esslog/parameters/autorecovery 0
