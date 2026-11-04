@@ -1,0 +1,6 @@
+prebuilt_etc {
+    name: "nk-modules.rc",
+    src: "nk-modules.rc",
+    vendor: true,
+    relative_install_path: "init",
+}

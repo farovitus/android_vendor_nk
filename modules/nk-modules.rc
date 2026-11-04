@@ -1,0 +1,16 @@
+# Kernel modules for Wi-Fi and zram on the NK 6.6 kernel.
+#
+# The kernel ZIP installs its modules, with modules.dep, in
+# /vendor/lib/modules. Load them early: zram must exist before it is
+# configured and swapon_all runs. If the directory or a module is
+# missing, modprobe fails and boot carries on without them.
+#
+# brcmfmac and cfg80211 request brcm/brcmfmac4358-pcie.{bin,txt} and
+# regulatory.db{,.p7s}. Point the kernel's direct firmware loader at
+# /vendor/firmware so no user-space fallback is needed.
+on early-init
+    write /sys/module/firmware_class/parameters/path /vendor/firmware
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules brcmfmac-wcc zram
+
+on init
+    write /sys/block/zram0/comp_algorithm lz4
