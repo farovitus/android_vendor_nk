@@ -7,6 +7,10 @@
 # mesa-$MESA.tar.xz, libdrm-$LIBDRM.tar.xz and a minigbm clone at
 # $MINIGBM. Host tools: meson, ninja, pkg-config, python3 with mako,
 # bison, flex, git, curl.
+#
+# Everything is tuned for the Exynos 7420's Cortex-A57 cores (-mcpu also
+# keeps the ISA at ARMv8.0, which the A53 cluster runs too), and Mesa is
+# built with link-time optimisation.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -51,11 +55,12 @@ build_arch() {
 	local B=$WORK/build SYS=$WORK/sysroot/$arch
 	local cross=$B/android-$arch.ini cpu_family=$arch cpu=armv8
 	[ $arch = arm ] && cpu=armv7
+	local tune=-mcpu=cortex-a57
 	cat > "$cross" <<EOF
 [binaries]
 ar = '$N/llvm-ar'
-c = ['$N/$triple-clang']
-cpp = ['$N/$triple-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++']
+c = ['$N/$triple-clang', '$tune']
+cpp = ['$N/$triple-clang++', '$tune', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '-static-libstdc++']
 c_ld = 'lld'
 cpp_ld = 'lld'
 strip = '$N/llvm-strip'
@@ -79,9 +84,10 @@ EOF
 		-Dudev=false -Dprefix="$SYS" -Dlibdir=lib
 	ninja -C "$B/libdrm-$arch" install
 
-	# Mesa: panfrost only, EGL and GLES, no LLVM.
+	# Mesa: panfrost only, EGL and GLES, no LLVM, with LTO.
 	meson setup --wipe "$B/mesa-$arch" "$WORK/src/mesa-$MESA" \
 		--cross-file="$cross" -Dbuildtype=release -Db_ndebug=true \
+		-Db_lto=true \
 		-Dplatforms=android -Dplatform-sdk-version=$API \
 		-Dandroid-stub=true -Dandroid-libbacktrace=disabled \
 		-Dgallium-drivers=panfrost -Dvulkan-drivers= -Dllvm=disabled \
@@ -106,7 +112,7 @@ EOF
 	"$N/$triple-clang++" -shared -fPIC -Wl,-soname,libcutils.so -o "$M/stub/libcutils.so" \
 		-I"$MESAINC" "$WORK/src/mesa-$MESA/src/android_stub/cutils_stub.cpp" \
 		-x c "$HERE/compat/native_handle_stub.c"
-	local def=(-D_GNU_SOURCE=1 -DHAS_NO_AIDL_METADATA -DNDEBUG -fPIC -O2 -Wall
+	local def=($tune -D_GNU_SOURCE=1 -DHAS_NO_AIDL_METADATA -DNDEBUG -fPIC -O2 -Wall
 		-Wno-unused-function -fvisibility=default)
 	local objs=() f o
 	for f in "$S"/*.c; do
@@ -128,7 +134,7 @@ EOF
 	# The HWC 1.4 KMS module.
 	local H=$B/hwc-$arch
 	mkdir -p "$H"
-	"$N/$triple-clang++" -std=c++17 -O2 -Wall -Wextra -Wno-missing-field-initializers \
+	"$N/$triple-clang++" $tune -std=c++17 -O2 -Wall -Wextra -Wno-missing-field-initializers \
 		-fPIC -shared -fno-exceptions -fno-rtti -static-libstdc++ \
 		-Wl,-soname,hwcomposer.s6kms.so -Wl,--no-undefined \
 		-I"$S/cros_gralloc" "${inc[@]}" "$HERE/hwc/hwc_kms.cpp" \
