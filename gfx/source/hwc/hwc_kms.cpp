@@ -1,17 +1,33 @@
 /*
  * Minimal HWC 1.4 module for the Galaxy S6 on mainline: SurfaceFlinger
  * composites every layer with GLES (Mesa panfrost); this module shows the
- * client target buffer (a minigbm dma-buf) on the exynos DRM CRTC and
- * drives vsync from a timer. Android's HWC2On1Adapter wraps it for
+ * client target buffer (a minigbm dma-buf) on the exynos DRM CRTC.
+ * Android's HWC2On1Adapter wraps it for
  * android.hardware.graphics.composer@2.1-service.
+ *
+ * Frames go out as non-blocking atomic commits: the GPU's acquire fence is
+ * handed to the kernel as the plane's IN_FENCE_FD, and the CRTC's
+ * OUT_FENCE_PTR comes back as the retire (present) fence, which signals
+ * when the frame reaches the panel. set() returns without waiting on the
+ * GPU or the flip. A test-only commit after the first mode set checks that
+ * the kernel accepts atomic flips. If it does not, or a later commit
+ * fails, the module falls back to the legacy path (wait for the GPU, page
+ * flip, wait for the flip). Setting vendor.hwc.s6kms.legacy=1 forces that
+ * path.
+ *
+ * The panel runs in command (i80) mode, so the kernel raises vblank only
+ * when a frame is sent. Vsync therefore comes from a timer, phase-locked
+ * to the completion time of each real flip.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -41,6 +57,7 @@ struct kms_ctx {
 
 	int fd;
 	uint32_t crtc_id;
+	int crtc_index;
 	uint32_t conn_id;
 	drmModeModeInfo mode;
 	bool mode_set;
@@ -48,10 +65,25 @@ struct kms_ctx {
 
 	struct fb_entry fbs[FB_CACHE];
 	unsigned int fb_next;
+	uint32_t cur_fb;	/* last committed */
+	uint32_t prev_fb;	/* on screen until cur_fb's flip completes */
+
+	/* Atomic path. */
+	bool atomic;
+	bool atomic_probed;
+	uint32_t plane_id;
+	uint32_t prop_plane_fb, prop_plane_crtc, prop_plane_in_fence;
+	uint32_t prop_crtc_out_fence;
+	int last_out;		/* our copy of the newest retire fence */
 
 	pthread_t vsync_thread;
+	pthread_t event_thread;
+	int stop_pipe[2];
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
+	pthread_cond_t flip_cond;
+	unsigned int flips;	/* completed flips, under lock */
+	int64_t anchor_ns;	/* time of the last completed flip, under lock */
 	bool vsync_on;
 	bool stop;
 	int64_t period_ns;
@@ -133,6 +165,10 @@ static int kms_init(struct kms_ctx *ctx)
 				break;
 			}
 	}
+	ctx->crtc_index = -1;
+	for (int i = 0; i < res->count_crtcs; i++)
+		if (res->crtcs[i] == ctx->crtc_id)
+			ctx->crtc_index = i;
 	drmModeFreeEncoder(enc);
 	drmModeFreeConnector(conn);
 	drmModeFreeResources(res);
@@ -147,6 +183,84 @@ static int kms_init(struct kms_ctx *ctx)
 	ALOGI("connector %u crtc %u mode %ux%u@%d", ctx->conn_id, ctx->crtc_id,
 	      ctx->mode.hdisplay, ctx->mode.vdisplay, hz);
 	return 0;
+}
+
+static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name,
+			uint64_t *value)
+{
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, obj, type);
+	uint32_t id = 0;
+
+	if (!props)
+		return 0;
+	for (uint32_t i = 0; i < props->count_props && !id; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(fd, props->props[i]);
+		if (p && !strcmp(p->name, name)) {
+			id = p->prop_id;
+			if (value)
+				*value = props->prop_values[i];
+		}
+		drmModeFreeProperty(p);
+	}
+	drmModeFreeObjectProperties(props);
+	return id;
+}
+
+static bool force_legacy(void)
+{
+	char v[PROP_VALUE_MAX] = "";
+
+	__system_property_get("vendor.hwc.s6kms.legacy", v);
+	return v[0] == '1' || !strcmp(v, "true");
+}
+
+/* Find the CRTC's primary plane and the properties a page flip needs. */
+static void atomic_init(struct kms_ctx *ctx)
+{
+	if (force_legacy()) {
+		ALOGI("legacy page flips forced by vendor.hwc.s6kms.legacy");
+		return;
+	}
+	if (ctx->crtc_index < 0 ||
+	    drmSetClientCap(ctx->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) ||
+	    drmSetClientCap(ctx->fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
+		ALOGI("no atomic modesetting, using legacy page flips");
+		return;
+	}
+
+	drmModePlaneResPtr pres = drmModeGetPlaneResources(ctx->fd);
+	for (uint32_t i = 0; pres && i < pres->count_planes && !ctx->plane_id; i++) {
+		drmModePlanePtr pl = drmModeGetPlane(ctx->fd, pres->planes[i]);
+		uint64_t type = 0;
+		if (pl && (pl->possible_crtcs & (1u << ctx->crtc_index)) &&
+		    prop_id(ctx->fd, pl->plane_id, DRM_MODE_OBJECT_PLANE, "type",
+			    &type) && type == DRM_PLANE_TYPE_PRIMARY)
+			ctx->plane_id = pl->plane_id;
+		drmModeFreePlane(pl);
+	}
+	drmModeFreePlaneResources(pres);
+
+	if (ctx->plane_id) {
+		ctx->prop_plane_fb = prop_id(ctx->fd, ctx->plane_id,
+					     DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
+		ctx->prop_plane_crtc = prop_id(ctx->fd, ctx->plane_id,
+					       DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
+		ctx->prop_plane_in_fence = prop_id(ctx->fd, ctx->plane_id,
+						   DRM_MODE_OBJECT_PLANE,
+						   "IN_FENCE_FD", NULL);
+	}
+	ctx->prop_crtc_out_fence = prop_id(ctx->fd, ctx->crtc_id,
+					   DRM_MODE_OBJECT_CRTC,
+					   "OUT_FENCE_PTR", NULL);
+
+	if (!ctx->plane_id || !ctx->prop_plane_fb || !ctx->prop_plane_crtc ||
+	    !ctx->prop_plane_in_fence || !ctx->prop_crtc_out_fence) {
+		ALOGE("atomic: missing plane %u or fence properties, using legacy page flips",
+		      ctx->plane_id);
+		return;
+	}
+	ctx->atomic = true;
+	ALOGI("atomic page flips on plane %u with in/out fences", ctx->plane_id);
 }
 
 static uint32_t opaque_format(uint32_t format)
@@ -185,8 +299,12 @@ static uint32_t fb_for(struct kms_ctx *ctx, buffer_handle_t handle)
 		if (ctx->fbs[i].fb_id && ctx->fbs[i].ino == st.st_ino)
 			return ctx->fbs[i].fb_id;
 
-	struct fb_entry *e = &ctx->fbs[ctx->fb_next];
-	ctx->fb_next = (ctx->fb_next + 1) % FB_CACHE;
+	/* Never remove a framebuffer that is on screen or about to be. */
+	struct fb_entry *e;
+	do {
+		e = &ctx->fbs[ctx->fb_next];
+		ctx->fb_next = (ctx->fb_next + 1) % FB_CACHE;
+	} while (e->fb_id && (e->fb_id == ctx->cur_fb || e->fb_id == ctx->prev_fb));
 	fb_release(ctx, e);
 
 	if (drmPrimeFDToHandle(ctx->fd, h->fds[0], &e->gem)) {
@@ -217,11 +335,60 @@ static uint32_t fb_for(struct kms_ctx *ctx, buffer_handle_t handle)
 static void flip_done(int fd, unsigned int seq, unsigned int sec,
 		      unsigned int usec, void *data)
 {
-	(void)fd; (void)seq; (void)sec; (void)usec;
-	*(bool *)data = true;
+	struct kms_ctx *ctx = (struct kms_ctx *)data;
+	(void)fd; (void)seq;
+
+	pthread_mutex_lock(&ctx->lock);
+	ctx->flips++;
+	ctx->anchor_ns = (int64_t)sec * 1000000000LL + (int64_t)usec * 1000LL;
+	pthread_cond_broadcast(&ctx->flip_cond);
+	pthread_mutex_unlock(&ctx->lock);
 }
 
-static int show(struct kms_ctx *ctx, uint32_t fb_id)
+/* Reads DRM events: flip completions from both paths. */
+static void *event_loop(void *arg)
+{
+	struct kms_ctx *ctx = (struct kms_ctx *)arg;
+	drmEventContext ev = {};
+	struct pollfd pfd[2] = {
+		{ .fd = ctx->fd, .events = POLLIN },
+		{ .fd = ctx->stop_pipe[0], .events = POLLIN },
+	};
+
+	ev.version = 2;
+	ev.page_flip_handler = flip_done;
+	for (;;) {
+		if (poll(pfd, 2, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (pfd[1].revents)
+			break;
+		if (pfd[0].revents & POLLIN)
+			drmHandleEvent(ctx->fd, &ev);
+	}
+	return NULL;
+}
+
+static void wait_fence(int fd, int timeout_ms)
+{
+	if (fd < 0)
+		return;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	poll(&pfd, 1, timeout_ms);
+}
+
+static void committed(struct kms_ctx *ctx, uint32_t fb_id)
+{
+	if (fb_id != ctx->cur_fb) {
+		ctx->prev_fb = ctx->cur_fb;
+		ctx->cur_fb = fb_id;
+	}
+}
+
+/* Legacy path: the caller has already waited for the GPU. */
+static int show_legacy(struct kms_ctx *ctx, uint32_t fb_id)
 {
 	if (!ctx->mode_set) {
 		if (drmModeSetCrtc(ctx->fd, ctx->crtc_id, fb_id, 0, 0,
@@ -230,39 +397,130 @@ static int show(struct kms_ctx *ctx, uint32_t fb_id)
 			return -errno;
 		}
 		ctx->mode_set = true;
+		committed(ctx, fb_id);
 		return 0;
 	}
 
-	bool done = false;
+	pthread_mutex_lock(&ctx->lock);
+	unsigned int start = ctx->flips;
+	pthread_mutex_unlock(&ctx->lock);
+
 	if (drmModePageFlip(ctx->fd, ctx->crtc_id, fb_id,
-			    DRM_MODE_PAGE_FLIP_EVENT, &done)) {
+			    DRM_MODE_PAGE_FLIP_EVENT, ctx)) {
 		/* No flip support or still busy: set the buffer directly. */
 		ctx->mode_set = false;
-		return show(ctx, fb_id);
+		return show_legacy(ctx, fb_id);
 	}
+	committed(ctx, fb_id);
 
 	/* Wait for the flip so the previous buffer is free when we return. */
-	drmEventContext ev = {};
-	ev.version = 2;
-	ev.page_flip_handler = flip_done;
-	struct pollfd pfd = { .fd = ctx->fd, .events = POLLIN };
-	while (!done) {
-		if (poll(&pfd, 1, 100) <= 0) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += 100000000L;
+	if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&ctx->lock);
+	while (ctx->flips == start)
+		if (pthread_cond_timedwait(&ctx->flip_cond, &ctx->lock, &ts)) {
 			ALOGE("page flip timed out");
 			break;
 		}
-		drmHandleEvent(ctx->fd, &ev);
-	}
+	pthread_mutex_unlock(&ctx->lock);
 	return 0;
 }
 
-static void wait_fence(int fd)
+/*
+ * Once the mode is set, ask the kernel whether it accepts a plain atomic
+ * page flip before relying on it.
+ */
+static bool atomic_probe(struct kms_ctx *ctx, uint32_t fb_id)
 {
-	if (fd < 0)
-		return;
-	struct pollfd pfd = { .fd = fd, .events = POLLIN };
-	poll(&pfd, 1, 3000);
-	close(fd);
+	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+	if (!req)
+		return false;
+	drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_plane_fb, fb_id);
+	drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_plane_crtc,
+				 ctx->crtc_id);
+	int ret = drmModeAtomicCommit(ctx->fd, req, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+	drmModeAtomicFree(req);
+	if (ret)
+		ALOGE("atomic test commit: %s, using legacy page flips",
+		      strerror(errno));
+	return !ret;
+}
+
+static int atomic_commit(struct kms_ctx *ctx, uint32_t fb_id, int in_fence,
+			 int32_t *out_fence)
+{
+	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+	if (!req)
+		return -ENOMEM;
+
+	*out_fence = -1;
+	drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_plane_fb, fb_id);
+	drmModeAtomicAddProperty(req, ctx->plane_id, ctx->prop_plane_crtc,
+				 ctx->crtc_id);
+	if (in_fence >= 0)
+		drmModeAtomicAddProperty(req, ctx->plane_id,
+					 ctx->prop_plane_in_fence, in_fence);
+	drmModeAtomicAddProperty(req, ctx->crtc_id, ctx->prop_crtc_out_fence,
+				 (uint64_t)(uintptr_t)out_fence);
+
+	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+	int ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
+	if (ret && errno == EBUSY) {
+		/* The previous frame is still queued: let it reach the panel. */
+		wait_fence(ctx->last_out, 100);
+		ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
+	}
+	if (ret)
+		ret = -errno;
+	drmModeAtomicFree(req);
+	return ret;
+}
+
+/*
+ * Show fb_id once in_fence signals. Takes ownership of in_fence. Returns
+ * the retire fence, or -1 when the frame is already on screen.
+ */
+static int show(struct kms_ctx *ctx, uint32_t fb_id, int in_fence)
+{
+	if (ctx->atomic && ctx->mode_set && !ctx->atomic_probed) {
+		ctx->atomic_probed = true;
+		ctx->atomic = atomic_probe(ctx, fb_id);
+	}
+	if (ctx->atomic && ctx->mode_set) {
+		int32_t out = -1;
+		int ret = atomic_commit(ctx, fb_id, in_fence, &out);
+		if (!ret) {
+			if (in_fence >= 0)
+				close(in_fence);
+			committed(ctx, fb_id);
+			if (ctx->last_out >= 0)
+				close(ctx->last_out);
+			ctx->last_out = out >= 0 ? dup(out) : -1;
+			return out;
+		}
+		ALOGE("atomic commit: %s, switching to legacy page flips",
+		      strerror(-ret));
+		ctx->atomic = false;
+		if (out >= 0)
+			close(out);
+	}
+
+	/* The first frame sets the mode through the legacy call. */
+	wait_fence(in_fence, 3000);
+	if (in_fence >= 0)
+		close(in_fence);
+	if (ctx->last_out >= 0) {
+		wait_fence(ctx->last_out, 100);
+		close(ctx->last_out);
+		ctx->last_out = -1;
+	}
+	show_legacy(ctx, fb_id);
+	return -1;
 }
 
 static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num,
@@ -288,23 +546,28 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num,
 		if (!c)
 			continue;
 		buffer_handle_t target = NULL;
+		int acquire = -1;
 		for (size_t i = 0; i < c->numHwLayers; i++) {
 			hwc_layer_1_t *l = &c->hwLayers[i];
 			if (d == 0 && l->compositionType == HWC_FRAMEBUFFER_TARGET) {
 				target = l->handle;
-				wait_fence(l->acquireFenceFd);
+				acquire = l->acquireFenceFd;
 			} else if (l->acquireFenceFd >= 0) {
 				close(l->acquireFenceFd);
 			}
 			l->acquireFenceFd = -1;
+			/*
+			 * SurfaceFlinger releases the previous client target
+			 * on the retire fence, so no per-layer fence is needed.
+			 */
 			l->releaseFenceFd = -1;
 		}
 		c->retireFenceFd = -1;
-		if (d == 0 && target) {
-			uint32_t fb = fb_for(ctx, target);
-			if (fb)
-				show(ctx, fb);
-		}
+		uint32_t fb = target ? fb_for(ctx, target) : 0;
+		if (fb)
+			c->retireFenceFd = show(ctx, fb, acquire);
+		else if (acquire >= 0)
+			close(acquire);
 	}
 	return 0;
 }
@@ -321,9 +584,15 @@ static void *vsync_loop(void *arg)
 			next = now_ns();
 			continue;
 		}
+		/* Keep the timer in phase with the last real flip. */
+		int64_t anchor = ctx->anchor_ns;
 		pthread_mutex_unlock(&ctx->lock);
 
 		next += ctx->period_ns;
+		if (anchor > 0 && anchor <= next) {
+			int64_t k = (next - anchor + ctx->period_ns / 2) / ctx->period_ns;
+			next = anchor + k * ctx->period_ns;
+		}
 		struct timespec ts = { (time_t)(next / 1000000000LL),
 				       (long)(next % 1000000000LL) };
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
@@ -460,9 +729,10 @@ static void hwc_dump(hwc_composer_device_1_t *dev, char *buff, int len)
 {
 	struct kms_ctx *ctx = (struct kms_ctx *)dev;
 
-	snprintf(buff, len, "hwc_kms: crtc %u connector %u %ux%u\n",
+	snprintf(buff, len, "hwc_kms: crtc %u connector %u %ux%u %s plane %u\n",
 		 ctx->crtc_id, ctx->conn_id, ctx->mode.hdisplay,
-		 ctx->mode.vdisplay);
+		 ctx->mode.vdisplay, ctx->atomic ? "atomic" : "legacy",
+		 ctx->plane_id);
 }
 
 static int hwc_close(hw_device_t *dev)
@@ -474,6 +744,13 @@ static int hwc_close(hw_device_t *dev)
 	pthread_cond_signal(&ctx->cond);
 	pthread_mutex_unlock(&ctx->lock);
 	pthread_join(ctx->vsync_thread, NULL);
+	if (write(ctx->stop_pipe[1], "x", 1) < 0)
+		ALOGE("stop event thread: %s", strerror(errno));
+	pthread_join(ctx->event_thread, NULL);
+	close(ctx->stop_pipe[0]);
+	close(ctx->stop_pipe[1]);
+	if (ctx->last_out >= 0)
+		close(ctx->last_out);
 	for (int i = 0; i < FB_CACHE; i++)
 		fb_release(ctx, &ctx->fbs[i]);
 	close(ctx->fd);
@@ -491,17 +768,23 @@ static int hwc_open(const hw_module_t *module, const char *name,
 	if (!ctx)
 		return -ENOMEM;
 
+	ctx->last_out = -1;
 	int ret = kms_init(ctx);
+	if (!ret && pipe2(ctx->stop_pipe, O_CLOEXEC))
+		ret = -errno;
 	if (ret) {
 		if (ctx->fd >= 0)
 			close(ctx->fd);
 		free(ctx);
 		return ret;
 	}
+	atomic_init(ctx);
 
 	pthread_mutex_init(&ctx->lock, NULL);
 	pthread_cond_init(&ctx->cond, NULL);
+	pthread_cond_init(&ctx->flip_cond, NULL);
 	pthread_create(&ctx->vsync_thread, NULL, vsync_loop, ctx);
+	pthread_create(&ctx->event_thread, NULL, event_loop, ctx);
 
 	ctx->dev.common.tag = HARDWARE_DEVICE_TAG;
 	ctx->dev.common.version = HWC_DEVICE_API_VERSION_1_4;
