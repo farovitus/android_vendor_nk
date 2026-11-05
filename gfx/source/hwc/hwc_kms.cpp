@@ -10,10 +10,11 @@
  * OUT_FENCE_PTR comes back as the retire (present) fence, which signals
  * when the frame reaches the panel. set() returns without waiting on the
  * GPU or the flip. A test-only commit after the first mode set checks that
- * the kernel accepts atomic flips. If it does not, or a later commit
- * fails, the module falls back to the legacy path (wait for the GPU, page
- * flip, wait for the flip). Setting vendor.hwc.s6kms.legacy=1 forces that
- * path.
+ * the kernel accepts atomic flips. If it does not, or a later commit is
+ * rejected with EINVAL or EOPNOTSUPP, the module falls back to the legacy
+ * path (wait for the GPU, page flip, wait for the flip). Other failures
+ * send only that frame the legacy way. Setting vendor.hwc.s6kms.legacy=1
+ * forces the legacy path.
  *
  * The panel runs in command (i80) mode, so the kernel raises vblank only
  * when a frame is sent. Vsync therefore comes from a free-running timer
@@ -479,9 +480,20 @@ static int atomic_commit(struct kms_ctx *ctx, uint32_t fb_id, int in_fence,
 
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
 	int ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
-	if (ret && errno == EBUSY) {
-		/* The previous frame is still queued: let it reach the panel. */
-		wait_fence(ctx->last_out, 100);
+	/*
+	 * EBUSY: the previous frame has not completed yet, because its GPU
+	 * work is slow or its 16.7 ms transfer is still running. Its retire
+	 * fence signals when the kernel completes that flip; wait for it and
+	 * try again. A slow frame (app launch, shader compile) must not end
+	 * the atomic path.
+	 */
+	for (int tries = 0; ret && errno == EBUSY && tries < 3; tries++) {
+		if (ctx->last_out >= 0) {
+			wait_fence(ctx->last_out, 1000);
+		} else {
+			struct timespec ts = { 0, (long)ctx->period_ns };
+			nanosleep(&ts, NULL);
+		}
 		ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
 	}
 	if (ret)
@@ -512,11 +524,18 @@ static int show(struct kms_ctx *ctx, uint32_t fb_id, int in_fence)
 			ctx->last_out = out >= 0 ? dup(out) : -1;
 			return out;
 		}
-		ALOGE("atomic commit: %s, switching to legacy page flips",
-		      strerror(-ret));
-		ctx->atomic = false;
 		if (out >= 0)
 			close(out);
+		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
+			/* The kernel rejects this commit itself: stop using it. */
+			ALOGE("atomic commit: %s, switching to legacy page flips",
+			      strerror(-ret));
+			ctx->atomic = false;
+		} else {
+			/* Transient: show this frame the legacy way, stay atomic. */
+			ALOGE("atomic commit: %s, legacy flip for this frame",
+			      strerror(-ret));
+		}
 	}
 
 	/* The first frame sets the mode through the legacy call. */
