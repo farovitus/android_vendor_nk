@@ -19,6 +19,12 @@
  * The panel runs in command (i80) mode, so the kernel raises vblank only
  * when a frame is sent. Vsync therefore comes from a free-running timer
  * at the mode's frame period.
+ *
+ * Power modes: OFF and DOZE_SUSPEND stop the vsync callbacks; NORMAL and
+ * DOZE start them again on a new timer phase. Turning the CRTC off as
+ * well (ACTIVE=0, or DPMS off on the legacy path) is opt-in through
+ * vendor.hwc.s6kms.crtc_off=1: the panel is left running by S-Boot and
+ * there is no panel driver to bring it back if DECON cannot.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -83,7 +89,12 @@ struct kms_ctx {
 	uint32_t plane_id;
 	uint32_t prop_plane_fb, prop_plane_crtc, prop_plane_in_fence;
 	uint32_t prop_crtc_out_fence;
+	uint32_t prop_crtc_active;
 	int last_out;		/* our copy of the newest retire fence */
+
+	/* Power. */
+	uint32_t prop_conn_dpms;
+	bool crtc_off;		/* CRTC turned off by setPowerMode */
 
 	pthread_t vsync_thread;
 	pthread_t event_thread;
@@ -93,8 +104,10 @@ struct kms_ctx {
 	pthread_cond_t flip_cond;
 	unsigned int flips;	/* completed flips, under lock */
 	bool vsync_on;
+	bool powered;		/* display on (NORMAL or DOZE), under lock */
 	bool stop;
 	int64_t period_ns;
+	int64_t epoch;		/* vsync phase, under lock */
 };
 
 static int64_t now_ns(void)
@@ -224,12 +237,17 @@ static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name,
 	return id;
 }
 
-static bool force_legacy(void)
+static bool prop_true(const char *name)
 {
 	char v[PROP_VALUE_MAX] = "";
 
-	__system_property_get("vendor.hwc.s6kms.legacy", v);
+	__system_property_get(name, v);
 	return v[0] == '1' || !strcmp(v, "true");
+}
+
+static bool force_legacy(void)
+{
+	return prop_true("vendor.hwc.s6kms.legacy");
 }
 
 /* Find the CRTC's primary plane and the properties a page flip needs. */
@@ -270,6 +288,8 @@ static void atomic_init(struct kms_ctx *ctx)
 	ctx->prop_crtc_out_fence = prop_id(ctx->fd, ctx->crtc_id,
 					   DRM_MODE_OBJECT_CRTC,
 					   "OUT_FENCE_PTR", NULL);
+	ctx->prop_crtc_active = prop_id(ctx->fd, ctx->crtc_id,
+					DRM_MODE_OBJECT_CRTC, "ACTIVE", NULL);
 
 	if (!ctx->plane_id || !ctx->prop_plane_fb || !ctx->prop_plane_crtc ||
 	    !ctx->prop_plane_in_fence || !ctx->prop_crtc_out_fence) {
@@ -534,6 +554,12 @@ static int atomic_commit(struct kms_ctx *ctx, uint32_t fb_id, int in_fence,
  */
 static int show(struct kms_ctx *ctx, uint32_t fb_id, int in_fence)
 {
+	if (ctx->crtc_off) {
+		/* Nothing scans out while the CRTC is off: drop the frame. */
+		if (in_fence >= 0)
+			close(in_fence);
+		return -1;
+	}
 	if (ctx->atomic && ctx->mode_set && !ctx->atomic_probed) {
 		ctx->atomic_probed = true;
 		ctx->atomic = atomic_probe(ctx, fb_id);
@@ -636,15 +662,15 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num,
 static void *vsync_loop(void *arg)
 {
 	struct kms_ctx *ctx = (struct kms_ctx *)arg;
-	const int64_t epoch = now_ns();
-	int64_t last = epoch;
 
 	pthread_mutex_lock(&ctx->lock);
+	int64_t last = ctx->epoch;
 	while (!ctx->stop) {
-		if (!ctx->vsync_on) {
+		if (!ctx->vsync_on || !ctx->powered) {
 			pthread_cond_wait(&ctx->cond, &ctx->lock);
 			continue;
 		}
+		const int64_t epoch = ctx->epoch;
 		pthread_mutex_unlock(&ctx->lock);
 
 		/* The next tick after now, never one already sent. */
@@ -660,7 +686,9 @@ static void *vsync_loop(void *arg)
 		last = next;
 
 		pthread_mutex_lock(&ctx->lock);
-		const hwc_procs_t *procs = ctx->vsync_on ? ctx->procs : NULL;
+		/* A power cycle during the sleep moved the phase: drop this tick. */
+		const hwc_procs_t *procs = ctx->vsync_on && ctx->powered &&
+			ctx->epoch == epoch ? ctx->procs : NULL;
 		if (procs && procs->vsync) {
 			/* The callback may call eventControl; do not hold the lock. */
 			pthread_mutex_unlock(&ctx->lock);
@@ -686,10 +714,82 @@ static int hwc_event_control(hwc_composer_device_1_t *dev, int disp, int event,
 	return 0;
 }
 
+/* Turn the CRTC on or off: atomic ACTIVE, or connector DPMS on the legacy path. */
+static int crtc_power(struct kms_ctx *ctx, bool on)
+{
+	int ret;
+
+	if (ctx->atomic && ctx->prop_crtc_active) {
+		drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+		if (!req)
+			return -ENOMEM;
+		drmModeAtomicAddProperty(req, ctx->crtc_id, ctx->prop_crtc_active, on);
+		/* Blocking: waits for an in-flight flip before the CRTC changes. */
+		ret = drmModeAtomicCommit(ctx->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET,
+					  NULL);
+		drmModeAtomicFree(req);
+	} else {
+		if (!ctx->prop_conn_dpms)
+			ctx->prop_conn_dpms = prop_id(ctx->fd, ctx->conn_id,
+						      DRM_MODE_OBJECT_CONNECTOR,
+						      "DPMS", NULL);
+		if (!ctx->prop_conn_dpms)
+			return -ENOTSUP;
+		ret = drmModeConnectorSetProperty(ctx->fd, ctx->conn_id,
+						  ctx->prop_conn_dpms,
+						  on ? DRM_MODE_DPMS_ON :
+						       DRM_MODE_DPMS_OFF);
+	}
+	return ret ? -errno : 0;
+}
+
 static int hwc_set_power_mode(hwc_composer_device_1_t *dev, int disp, int mode)
 {
-	(void)dev; (void)mode;
-	return disp == 0 ? 0 : -EINVAL;
+	struct kms_ctx *ctx = (struct kms_ctx *)dev;
+	bool on;
+
+	if (disp != 0)
+		return -EINVAL;
+	switch (mode) {
+	case HWC_POWER_MODE_OFF:
+	case HWC_POWER_MODE_DOZE_SUSPEND:
+		on = false;
+		break;
+	case HWC_POWER_MODE_NORMAL:
+	case HWC_POWER_MODE_DOZE:
+		on = true;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (on && ctx->crtc_off) {
+		int ret = crtc_power(ctx, true);
+		if (ret) {
+			/* The next frame sets the mode again through SetCrtc. */
+			ALOGE("CRTC on: %s, mode set on the next frame",
+			      strerror(-ret));
+			ctx->mode_set = false;
+		}
+		ctx->crtc_off = false;
+	} else if (!on && !ctx->crtc_off && ctx->mode_set &&
+		   prop_true("vendor.hwc.s6kms.crtc_off")) {
+		int ret = crtc_power(ctx, false);
+		if (ret)
+			ALOGE("CRTC off: %s, leaving it on", strerror(-ret));
+		else
+			ctx->crtc_off = true;
+	}
+
+	pthread_mutex_lock(&ctx->lock);
+	if (on && !ctx->powered)
+		ctx->epoch = now_ns();
+	ctx->powered = on;
+	pthread_cond_signal(&ctx->cond);
+	pthread_mutex_unlock(&ctx->lock);
+	ALOGI("power mode %d: vsync %s, CRTC %s", mode, on ? "on" : "off",
+	      ctx->crtc_off ? "off" : "on");
+	return 0;
 }
 
 static int hwc_query(hwc_composer_device_1_t *dev, int what, int *value)
@@ -792,10 +892,10 @@ static void hwc_dump(hwc_composer_device_1_t *dev, char *buff, int len)
 {
 	struct kms_ctx *ctx = (struct kms_ctx *)dev;
 
-	snprintf(buff, len, "hwc_kms: crtc %u connector %u %ux%u %s plane %u\n",
+	snprintf(buff, len, "hwc_kms: crtc %u connector %u %ux%u %s plane %u%s\n",
 		 ctx->crtc_id, ctx->conn_id, ctx->mode.hdisplay,
 		 ctx->mode.vdisplay, ctx->atomic ? "atomic" : "legacy",
-		 ctx->plane_id);
+		 ctx->plane_id, ctx->crtc_off ? " crtc off" : "");
 }
 
 static int hwc_close(hw_device_t *dev)
@@ -846,6 +946,8 @@ static int hwc_open(const hw_module_t *module, const char *name,
 	pthread_mutex_init(&ctx->lock, NULL);
 	pthread_cond_init(&ctx->cond, NULL);
 	pthread_cond_init(&ctx->flip_cond, NULL);
+	ctx->powered = true;
+	ctx->epoch = now_ns();
 	pthread_create(&ctx->vsync_thread, NULL, vsync_loop, ctx);
 	pthread_create(&ctx->event_thread, NULL, event_loop, ctx);
 
