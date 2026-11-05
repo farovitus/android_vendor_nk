@@ -1,9 +1,16 @@
-# Kernel modules for Wi-Fi and zram on the NK 6.6 kernel.
+# Kernel modules for Wi-Fi, zram and audio on the NK 6.6 kernel.
 #
-# The kernel ZIP installs its modules, with modules.dep, in
-# /vendor/lib/modules. Load them early: zram must exist before it is
-# configured and swapon_all runs. If the directory or a module is
-# missing, modprobe fails and boot carries on without them.
+# The device tree ships the prebuilt kernel's modules, and the build
+# installs them with modules.dep in /vendor/lib/modules. Load them early:
+# zram must exist before it is configured and swapon_all runs. If the
+# directory or a module is missing, modprobe fails and boot carries on
+# without them.
+#
+# Audio: the WM1840 (CS47L85) core and its SPI bus, its IRQ, pinctrl,
+# GPIO and MICVDD children, the codec, the I2S and IDMA DAIs, the
+# MAX98505 speaker amp and the zero-wm1840 machine driver. The MFD
+# children and bus drivers bind by device, not by symbol, so modules.dep
+# alone does not pull them in.
 #
 # brcmfmac and cfg80211 request brcm/brcmfmac4358-pcie.{bin,txt} and
 # regulatory.db{,.p7s}. Point the kernel's direct firmware loader at
@@ -11,6 +18,7 @@
 on early-init
     write /sys/module/firmware_class/parameters/path /vendor/firmware
     exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules brcmfmac-wcc zram
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules madera madera-spi irq-madera pinctrl-madera gpio-madera arizona-micsupp snd-soc-madera cs_dsp snd-soc-wm-adsp snd-soc-cs47l85 snd-soc-idma snd-soc-i2s snd-soc-max98925 snd-soc-zero-wm1840
 
 on init
     write /sys/block/zram0/comp_algorithm lz4
