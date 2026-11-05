@@ -1,0 +1,10 @@
+# Bluetooth on the NK 6.6 kernel.
+#
+# hci_uart (with bluetooth, btbcm and rfkill from modules.dep) binds the
+# BCM4358 on UART4 through serdev hci_bcm. Registering hci0 powers the
+# chip and btbcm requests brcm/BCM4358A3.hcd. Load it on init, after
+# nk-modules.rc has pointed the direct firmware loader at /vendor/firmware
+# on early-init. If the module is missing, modprobe fails and boot carries
+# on without Bluetooth.
+on init
+    exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules hci_uart
