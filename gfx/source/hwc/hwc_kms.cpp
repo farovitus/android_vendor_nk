@@ -709,8 +709,11 @@ static int hwc_get_display_configs(hwc_composer_device_1_t *dev, int disp,
 
 static int32_t dpi(uint32_t px, uint32_t mm)
 {
-	/* HWC 1 reports dots per thousand inches. S6: 577 ppi. */
-	return mm ? (int32_t)(px * 25400000ULL / mm) : 577000;
+	/*
+	 * HWC 1 reports dots per thousand inches: px / (mm / 25.4) * 1000.
+	 * S6: 577 ppi.
+	 */
+	return mm ? (int32_t)(px * 25400ULL / mm) : 577000;
 }
 
 static int hwc_get_display_attributes(hwc_composer_device_1_t *dev, int disp,
