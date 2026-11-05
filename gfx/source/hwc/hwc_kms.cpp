@@ -178,10 +178,20 @@ static int kms_init(struct kms_ctx *ctx)
 		return -ENODEV;
 	}
 
-	int hz = ctx->mode.vrefresh ? ctx->mode.vrefresh : 60;
-	ctx->period_ns = 1000000000LL / hz;
-	ALOGI("connector %u crtc %u mode %ux%u@%d", ctx->conn_id, ctx->crtc_id,
-	      ctx->mode.hdisplay, ctx->mode.vdisplay, hz);
+	/*
+	 * The frame period follows from the mode's timing, not from its
+	 * rounded vrefresh: the zeroflte mode (222371 kHz, 1443 x 2577 total)
+	 * takes 16.72 ms per frame, 59.80 Hz, not 60.
+	 */
+	const drmModeModeInfo *m = &ctx->mode;
+	if (m->clock && m->htotal && m->vtotal) {
+		int64_t px = (int64_t)m->htotal * m->vtotal;
+		ctx->period_ns = (px * 1000000LL + m->clock / 2) / m->clock;
+	} else {
+		ctx->period_ns = 1000000000LL / (m->vrefresh ? m->vrefresh : 60);
+	}
+	ALOGI("connector %u crtc %u mode %ux%u period %lld ns", ctx->conn_id,
+	      ctx->crtc_id, m->hdisplay, m->vdisplay, (long long)ctx->period_ns);
 	return 0;
 }
 
