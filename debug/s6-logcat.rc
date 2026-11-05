@@ -11,7 +11,7 @@ on post-fs-data
     start s6logcat
 
 # A completed boot stays up: cancel the kernel's test-boot auto-recovery.
-# SurfaceFlinger sets service.bootanim.exit when the boot animation ends;
-# sys.boot_completed waits for the first unlock of a secured user.
-on property:service.bootanim.exit=1
+# ActivityManager sets sys.boot_completed in finishBooting, at the lock
+# screen and before the first credential unlock.
+on property:sys.boot_completed=1
     write /sys/module/dsh_esslog/parameters/autorecovery 0
