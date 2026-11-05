@@ -325,11 +325,17 @@ static uint32_t fb_for(struct kms_ctx *ctx, buffer_handle_t handle)
 	uint32_t handles[4] = { e->gem };
 	uint32_t pitches[4] = { h->strides[0] };
 	uint32_t offsets[4] = { h->offsets[0] };
-	uint32_t format = h->format;
+	/*
+	 * The client target fills the primary plane and is opaque. With an
+	 * alpha format DECON turns on per-pixel blending (WINCONx_BLD_PIX)
+	 * for the window, so scan it out as XRGB/XBGR and fall back to the
+	 * buffer's own format only if the kernel refuses that.
+	 */
+	uint32_t format = opaque_format(h->format);
 
 	if (drmModeAddFB2(ctx->fd, h->width, h->height, format, handles, pitches,
 			  offsets, &e->fb_id, 0)) {
-		format = opaque_format(format);
+		format = h->format;
 		if (drmModeAddFB2(ctx->fd, h->width, h->height, format, handles,
 				  pitches, offsets, &e->fb_id, 0)) {
 			ALOGE("AddFB2 %ux%u %.4s: %s", h->width, h->height,
