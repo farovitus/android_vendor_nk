@@ -44,12 +44,20 @@
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+/*
+ * Framebuffers for the client target ring (normally 3 buffers). An entry
+ * keeps its dma-buf alive through the GEM handle, so one that has not
+ * been shown for FB_IDLE_FRAMES frames is dropped: SurfaceFlinger has
+ * reallocated its ring and the old buffer's memory would stay pinned.
+ */
 #define FB_CACHE 8
+#define FB_IDLE_FRAMES 120
 
 struct fb_entry {
 	ino_t ino;
 	uint32_t fb_id;
 	uint32_t gem;
+	uint64_t used;		/* frame that last showed it */
 };
 
 struct kms_ctx {
@@ -65,7 +73,7 @@ struct kms_ctx {
 	uint32_t width_mm, height_mm;
 
 	struct fb_entry fbs[FB_CACHE];
-	unsigned int fb_next;
+	uint64_t frame;
 	uint32_t cur_fb;	/* last committed */
 	uint32_t prev_fb;	/* on screen until cur_fb's flip completes */
 
@@ -305,17 +313,29 @@ static uint32_t fb_for(struct kms_ctx *ctx, buffer_handle_t handle)
 	if (!h || h->numFds < 1 || fstat(h->fds[0], &st))
 		return 0;
 
-	for (int i = 0; i < FB_CACHE; i++)
-		if (ctx->fbs[i].fb_id && ctx->fbs[i].ino == st.st_ino)
-			return ctx->fbs[i].fb_id;
+	uint64_t frame = ++ctx->frame;
+	struct fb_entry *hit = NULL, *e = NULL;
 
-	/* Never remove a framebuffer that is on screen or about to be. */
-	struct fb_entry *e;
-	do {
-		e = &ctx->fbs[ctx->fb_next];
-		ctx->fb_next = (ctx->fb_next + 1) % FB_CACHE;
-	} while (e->fb_id && (e->fb_id == ctx->cur_fb || e->fb_id == ctx->prev_fb));
+	for (int i = 0; i < FB_CACHE; i++) {
+		struct fb_entry *f = &ctx->fbs[i];
+		if (f->fb_id && f->ino == st.st_ino) {
+			f->used = frame;
+			hit = f;
+			continue;
+		}
+		/* Never remove a framebuffer that is on screen or about to be. */
+		if (f->fb_id && (f->fb_id == ctx->cur_fb || f->fb_id == ctx->prev_fb))
+			continue;
+		if (f->fb_id && frame - f->used > FB_IDLE_FRAMES)
+			fb_release(ctx, f);
+		/* A free slot, else the least recently shown entry. */
+		if (!e || (e->fb_id && (!f->fb_id || f->used < e->used)))
+			e = f;
+	}
+	if (hit)
+		return hit->fb_id;
 	fb_release(ctx, e);
+	e->used = frame;
 
 	if (drmPrimeFDToHandle(ctx->fd, h->fds[0], &e->gem)) {
 		ALOGE("PrimeFDToHandle: %s", strerror(errno));
