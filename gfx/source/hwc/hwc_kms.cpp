@@ -12,9 +12,11 @@
  * GPU or the flip. A test-only commit after the first mode set checks that
  * the kernel accepts atomic flips. If it does not, or a later commit is
  * rejected with EINVAL or EOPNOTSUPP, the module falls back to the legacy
- * path (wait for the GPU, page flip, wait for the flip). Other failures
- * send only that frame the legacy way. Setting vendor.hwc.s6kms.legacy=1
- * forces the legacy path.
+ * path (wait for the GPU, page flip, wait for the flip). A commit that
+ * stays busy past a bounded wait on the previous frame, or fails in another
+ * way, drops only that frame: the previous one stays on screen. Nothing
+ * page-flips or sets the mode over a pending commit. Setting
+ * vendor.hwc.s6kms.legacy=1 forces the legacy path.
  *
  * The panel runs in command (i80) mode, so the kernel raises vblank only
  * when a frame is sent. Vsync therefore comes from a free-running timer
@@ -58,6 +60,13 @@
  */
 #define FB_CACHE 8
 #define FB_IDLE_FRAMES 120
+
+/*
+ * How long a frame may wait for the previous commit to complete before it
+ * is dropped: long enough for a slow GPU frame (app launch, shader
+ * compile), short enough that a stuck one does not stall SurfaceFlinger.
+ */
+#define BUSY_WAIT_MS 1000
 
 struct fb_entry {
 	ino_t ino;
@@ -435,6 +444,12 @@ static void wait_fence(int fd, int timeout_ms)
 	poll(&pfd, 1, timeout_ms);
 }
 
+static bool fence_signalled(int fd)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	return fd < 0 || poll(&pfd, 1, 0) > 0;
+}
+
 static void committed(struct kms_ctx *ctx, uint32_t fb_id)
 {
 	if (fb_id != ctx->cur_fb) {
@@ -463,7 +478,12 @@ static int show_legacy(struct kms_ctx *ctx, uint32_t fb_id)
 
 	if (drmModePageFlip(ctx->fd, ctx->crtc_id, fb_id,
 			    DRM_MODE_PAGE_FLIP_EVENT, ctx)) {
-		/* No flip support or still busy: set the buffer directly. */
+		if (errno == EBUSY) {
+			/* The previous flip is still pending: keep it. */
+			ALOGE("page flip busy, dropping the frame");
+			return -EBUSY;
+		}
+		/* No flip support: set the buffer directly. */
 		ctx->mode_set = false;
 		return show_legacy(ctx, fb_id);
 	}
@@ -525,25 +545,29 @@ static int atomic_commit(struct kms_ctx *ctx, uint32_t fb_id, int in_fence,
 				 (uint64_t)(uintptr_t)out_fence);
 
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+	/* libdrm returns -errno itself; errno may be stale after its frees. */
 	int ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
 	/*
 	 * EBUSY: the previous frame has not completed yet, because its GPU
 	 * work is slow or its 16.7 ms transfer is still running. Its retire
 	 * fence signals when the kernel completes that flip; wait for it and
-	 * try again. A slow frame (app launch, shader compile) must not end
-	 * the atomic path.
+	 * try again. The kernel may still be finishing that commit for a
+	 * moment after the fence signals, so retry in 1 ms steps then. The
+	 * whole wait is bounded by BUSY_WAIT_MS.
 	 */
-	for (int tries = 0; ret && errno == EBUSY && tries < 3; tries++) {
-		if (ctx->last_out >= 0) {
-			wait_fence(ctx->last_out, 1000);
+	int64_t deadline = now_ns() + BUSY_WAIT_MS * 1000000LL;
+	while (ret == -EBUSY) {
+		int64_t left = deadline - now_ns();
+		if (left <= 0)
+			break;
+		if (!fence_signalled(ctx->last_out)) {
+			wait_fence(ctx->last_out, (int)((left + 999999) / 1000000));
 		} else {
-			struct timespec ts = { 0, (long)ctx->period_ns };
+			struct timespec ts = { 0, 1000000L };
 			nanosleep(&ts, NULL);
 		}
 		ret = drmModeAtomicCommit(ctx->fd, req, flags, ctx);
 	}
-	if (ret)
-		ret = -errno;
 	drmModeAtomicFree(req);
 	return ret;
 }
@@ -584,21 +608,40 @@ static int show(struct kms_ctx *ctx, uint32_t fb_id, int in_fence)
 			      strerror(-ret));
 			ctx->atomic = false;
 		} else {
-			/* Transient: show this frame the legacy way, stay atomic. */
-			ALOGE("atomic commit: %s, legacy flip for this frame",
+			/*
+			 * Still busy after the bounded wait, or another
+			 * transient error. A page flip would hit the same
+			 * pending commit and a SetCrtc would redo the whole
+			 * mode, so drop this frame and stay atomic: the
+			 * previous frame stays on screen and its retire fence
+			 * stands for this one.
+			 */
+			ALOGE("atomic commit: %s, dropping the frame",
 			      strerror(-ret));
+			if (in_fence >= 0)
+				close(in_fence);
+			return ctx->last_out >= 0 ? dup(ctx->last_out) : -1;
 		}
 	}
 
-	/* The first frame sets the mode through the legacy call. */
-	wait_fence(in_fence, 3000);
-	if (in_fence >= 0)
-		close(in_fence);
+	/*
+	 * Legacy path; the first frame sets the mode through it. Never page
+	 * flip over an atomic commit that is still pending.
+	 */
 	if (ctx->last_out >= 0) {
-		wait_fence(ctx->last_out, 100);
+		wait_fence(ctx->last_out, BUSY_WAIT_MS);
+		if (!fence_signalled(ctx->last_out)) {
+			ALOGE("atomic commit still pending, dropping the frame");
+			if (in_fence >= 0)
+				close(in_fence);
+			return dup(ctx->last_out);
+		}
 		close(ctx->last_out);
 		ctx->last_out = -1;
 	}
+	wait_fence(in_fence, 3000);
+	if (in_fence >= 0)
+		close(in_fence);
 	show_legacy(ctx, fb_id);
 	return -1;
 }
