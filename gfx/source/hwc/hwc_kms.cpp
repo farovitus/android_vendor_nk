@@ -16,8 +16,8 @@
  * path.
  *
  * The panel runs in command (i80) mode, so the kernel raises vblank only
- * when a frame is sent. Vsync therefore comes from a timer, phase-locked
- * to the completion time of each real flip.
+ * when a frame is sent. Vsync therefore comes from a free-running timer
+ * at the mode's frame period.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -83,7 +83,6 @@ struct kms_ctx {
 	pthread_cond_t cond;
 	pthread_cond_t flip_cond;
 	unsigned int flips;	/* completed flips, under lock */
-	int64_t anchor_ns;	/* time of the last completed flip, under lock */
 	bool vsync_on;
 	bool stop;
 	int64_t period_ns;
@@ -348,9 +347,9 @@ static void flip_done(int fd, unsigned int seq, unsigned int sec,
 	struct kms_ctx *ctx = (struct kms_ctx *)data;
 	(void)fd; (void)seq;
 
+	(void)sec; (void)usec;
 	pthread_mutex_lock(&ctx->lock);
 	ctx->flips++;
-	ctx->anchor_ns = (int64_t)sec * 1000000000LL + (int64_t)usec * 1000LL;
 	pthread_cond_broadcast(&ctx->flip_cond);
 	pthread_mutex_unlock(&ctx->lock);
 }
@@ -582,32 +581,38 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num,
 	return 0;
 }
 
+/*
+ * Free-running vsync: ticks fall on epoch + k * period, also across
+ * vsync off and on, so SurfaceFlinger sees one steady phase. Flip
+ * completions are not used as a phase reference: in command mode they
+ * land at vsync plus SurfaceFlinger's offset, GPU time and the transfer,
+ * and re-anchoring on them moved the phase with every frame.
+ */
 static void *vsync_loop(void *arg)
 {
 	struct kms_ctx *ctx = (struct kms_ctx *)arg;
-	int64_t next = now_ns();
+	const int64_t epoch = now_ns();
+	int64_t last = epoch;
 
 	pthread_mutex_lock(&ctx->lock);
 	while (!ctx->stop) {
 		if (!ctx->vsync_on) {
 			pthread_cond_wait(&ctx->cond, &ctx->lock);
-			next = now_ns();
 			continue;
 		}
-		/* Keep the timer in phase with the last real flip. */
-		int64_t anchor = ctx->anchor_ns;
 		pthread_mutex_unlock(&ctx->lock);
 
-		next += ctx->period_ns;
-		if (anchor > 0 && anchor <= next) {
-			int64_t k = (next - anchor + ctx->period_ns / 2) / ctx->period_ns;
-			next = anchor + k * ctx->period_ns;
-		}
+		/* The next tick after now, never one already sent. */
+		int64_t from = now_ns();
+		if (from < last)
+			from = last;
+		int64_t next = epoch +
+			((from - epoch) / ctx->period_ns + 1) * ctx->period_ns;
 		struct timespec ts = { (time_t)(next / 1000000000LL),
 				       (long)(next % 1000000000LL) };
-		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-		if (now_ns() - next > ctx->period_ns)
-			next = now_ns();
+		while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR)
+			;
+		last = next;
 
 		pthread_mutex_lock(&ctx->lock);
 		const hwc_procs_t *procs = ctx->vsync_on ? ctx->procs : NULL;
