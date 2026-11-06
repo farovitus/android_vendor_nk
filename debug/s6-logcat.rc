@@ -9,9 +9,3 @@ service s6logcat /system/bin/logcat -b main -b system -b crash -b events -v thre
 on post-fs-data
     exec -- /system/bin/rm -f /data/local/tmp/s6-logcat.txt /data/local/tmp/s6-logcat.txt.1 /data/local/tmp/s6-logcat.txt.2 /data/local/tmp/s6-logcat.txt.3 /data/local/tmp/s6-logcat.txt.4
     start s6logcat
-
-# A completed boot stays up: cancel the kernel's test-boot auto-recovery.
-# ActivityManager sets sys.boot_completed in finishBooting, at the lock
-# screen and before the first credential unlock.
-on property:sys.boot_completed=1
-    write /sys/module/dsh_esslog/parameters/autorecovery 0

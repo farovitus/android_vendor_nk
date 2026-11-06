@@ -1,5 +1,5 @@
-// Bring-up only: logcat to /data for reading from TWRP, and cancelling the
-// kernel's test-boot auto-recovery once the boot animation ends.
+// Bring-up only: logcat to /data for reading from TWRP. The auto-recovery
+// cancel ships in every build, from modules/nk-modules.rc.
 prebuilt_etc {
     name: "nk_s6logcat.rc",
     src: "s6-logcat.rc",
